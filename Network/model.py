@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
-from motion_net import MotionNet
+from MotionNet import MotionNet
 from backbone import Backbone
-from warp import warp_feature
-from box_encoding import box_to_heatmap
+from Warp import warp_feature
+from encoding import box_to_heatmap
 from head import TemporalDeltaBoxHead
 
 class PMD_TSD_Box(nn.Module):
