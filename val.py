@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from Network.model import PMD_TSD_Box
-from Network.LossFunction import temporal_loss
+from TrackingNetwork.model import PMD_TSD_Box
+from TrackingNetwork.LossFunction import temporal_loss
 from Dataset import SingleFrameDataset
 import config as cfg
 
@@ -24,7 +24,7 @@ LAMBDA_CONF = cfg.LAMBDA_CONF
 VAL_VIS_ROOT = "vis_val"
 # 验证时你说想“每张都可视化”，那就每个 batch 都保存
 SAVE_ALL_VAL = True
-MAX_VIS_IMAGES = 999999  # SAVE_ALL_VAL=True 时这个无所谓
+MAX_VIS_IMAGES = 999999
 
 
 # =========================

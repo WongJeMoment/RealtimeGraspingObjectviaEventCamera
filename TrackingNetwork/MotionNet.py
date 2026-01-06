@@ -24,6 +24,7 @@ class MotionNet(nn.Module):
         self.fc.bias.data = torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float)
 
     def forward(self, img_t, img_tm1):
+        # 拼接两帧图像
         x = torch.cat([img_t, img_tm1], dim=1)
         feat = self.encoder(x).flatten(1)
         theta = self.fc(feat).view(-1, 2, 3)

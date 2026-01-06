@@ -4,8 +4,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import torch.optim as optim
 
-from Network.model import PMD_TSD_Box
-from Network.LossFunction import temporal_loss
+from TrackingNetwork.model import PMD_TSD_Box
+from TrackingNetwork.LossFunction import temporal_loss
 from Dataset import SingleFrameDataset
 import config as cfg
 

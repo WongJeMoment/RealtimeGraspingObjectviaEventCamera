@@ -29,8 +29,8 @@ def split_avi_to_frames(video_path, out_dir, prefix="frame", start_index=0, ext=
 
 if __name__ == "__main__":
     split_avi_to_frames(
-        video_path="/home/wangzhe/ICME2026/MyDataset/Video/l3.avi",
-        out_dir="/home/wangzhe/ICME2026/MyDataset/IMG/l3",
+        video_path="/home/wangzhe/2026/IROS/Dataset/VideoNew/apple2.mp4",
+        out_dir="/home/wangzhe/2026/IROS/Dataset/Img/apple2",
         prefix="frame",
         ext="png"   # 也可以用 "jpg"
     )

@@ -55,7 +55,7 @@ def rename_to_numbers_force(folder, ext=".png", start=1):
 
 if __name__ == "__main__":
     rename_to_numbers_force(
-        folder=r"/home/wangzhe/ICME2026/MyDataset/IMG/l",
+        folder=r"/home/wangzhe/2026/IROS/Dataset/Img/apple2",
         ext=".png",  # 统一改成 png
         start=1  # 编号从 1 开始
     )

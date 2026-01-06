@@ -1,29 +1,32 @@
+import os
 import random
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torchvision.io import read_image
 from torchvision.transforms import functional as TF
 
 class SingleFrameDataset(Dataset):
     """
-    假设 self.data 每条是:
-      {"img_path": "...", "bbox": [cx, cy, w, h]}  # bbox 归一化到[0,1]
-    img 返回 float32, 范围 [0,1], shape [3,H,W]
-    bbox 返回 float32, shape [4] (cx,cy,w,h), 仍然归一化
+    self.data: list[str]  每条是图片路径
+    label: 与图片同名的 txt，内容 YOLO 格式：cls cx cy w h（归一化）
+    返回:
+      {"img": float32 [3,H,W] in [0,1], "bbox": float32 [4] (cx,cy,w,h) norm}
     """
     def __init__(
         self,
-        data_list,
+        data_list,              # list[str] image paths
+        label_dir=None,         # 如果 txt 和图片在同一目录，可传 None
         img_size=(256, 256),
         augment=True,
         p_flip=0.5,
         p_color=0.8,
         p_erase=0.25,
         p_geom=0.5,
+        choose_box="first",     # "first" | "random" | "largest"
     ):
         super().__init__()
         self.data = data_list
+        self.label_dir = label_dir
         self.img_size = img_size
         self.augment = augment
 
@@ -32,12 +35,13 @@ class SingleFrameDataset(Dataset):
         self.p_erase = p_erase
         self.p_geom = p_geom
 
+        self.choose_box = choose_box
+
     def __len__(self):
         return len(self.data)
 
     @staticmethod
     def _clamp_bbox_norm(cx, cy, w, h):
-        # 防止异常值：w/h 最小给个下限
         w = float(max(w, 1e-6))
         h = float(max(h, 1e-6))
         cx = float(min(max(cx, 0.0), 1.0))
@@ -46,31 +50,69 @@ class SingleFrameDataset(Dataset):
         h = float(min(max(h, 0.0), 1.0))
         return cx, cy, w, h
 
+    def _label_path_from_img(self, img_path: str) -> str:
+        stem = os.path.splitext(os.path.basename(img_path))[0]
+        if self.label_dir is None:
+            # 和图片同目录
+            return os.path.join(os.path.dirname(img_path), stem + ".txt")
+        else:
+            return os.path.join(self.label_dir, stem + ".txt")
+
+    def _read_yolo_bboxes(self, label_path: str):
+        """
+        读取一个 txt 中所有 bbox:
+        返回 list of (cls:int, cx,cy,w,h) 都是 float
+        """
+        if not os.path.exists(label_path):
+            return []
+
+        records = []
+        with open(label_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                cls = int(float(parts[0]))
+                cx, cy, w, h = map(float, parts[1:5])
+                cx, cy, w, h = self._clamp_bbox_norm(cx, cy, w, h)
+                records.append((cls, cx, cy, w, h))
+        return records
+
+    def _select_one_bbox(self, records):
+        """
+        单目标训练：从多框里选一个 bbox
+        """
+        if len(records) == 0:
+            # 没标注就给一个极小框（避免崩，但训练可能没意义；你也可以改成 raise）
+            return torch.tensor([0.5, 0.5, 1e-6, 1e-6], dtype=torch.float32)
+
+        if self.choose_box == "random":
+            cls, cx, cy, w, h = random.choice(records)
+        elif self.choose_box == "largest":
+            # 按面积选最大框
+            cls, cx, cy, w, h = max(records, key=lambda r: r[3] * r[4])
+        else:
+            # 默认第一行
+            cls, cx, cy, w, h = records[0]
+
+        return torch.tensor([cx, cy, w, h], dtype=torch.float32)
+
     def _random_geom_weak(self, img, bbox):
-        """
-        弱几何增强：随机缩放 + 平移（不旋转），并同步更新 bbox。
-        做法：先 pad 再 crop 到原大小，等价于缩放/平移。
-        """
         cx, cy, w, h = bbox.tolist()
         C, H, W = img.shape
 
-        # 随机缩放比例（越接近1越弱）
         scale = random.uniform(0.9, 1.1)
-
-        # 先把图 resize 到 scaled size
         newH = max(1, int(round(H * scale)))
         newW = max(1, int(round(W * scale)))
         img2 = TF.resize(img, [newH, newW], antialias=True)
 
-        # 计算 bbox 在缩放后仍然是归一化坐标，因此：
-        # 如果只是resize，归一化坐标不变（因为相对位置不变）
         cx2, cy2, w2, h2 = cx, cy, w, h
 
-        # 为了能 crop 回 (H,W)，需要 pad 或 crop
-        # 我们统一 pad 到至少(H,W)，再随机 crop
         padH = max(0, H - newH)
         padW = max(0, W - newW)
-        # pad 分到上下左右
         pad_top = padH // 2
         pad_bottom = padH - pad_top
         pad_left = padW // 2
@@ -79,17 +121,14 @@ class SingleFrameDataset(Dataset):
         if padH > 0 or padW > 0:
             img2 = TF.pad(img2, [pad_left, pad_top, pad_right, pad_bottom])
 
-            # pad 会改变归一化坐标：原图内容被放到更大画布中
             canvasH = newH + padH
             canvasW = newW + padW
 
-            # bbox 的中心点在 canvas 上的位置（以像素计）
             x = cx2 * newW + pad_left
             y = cy2 * newH + pad_top
             bw = w2 * newW
             bh = h2 * newH
 
-            # 转回归一化（相对于 canvas）
             cx2 = x / canvasW
             cy2 = y / canvasH
             w2 = bw / canvasW
@@ -97,8 +136,6 @@ class SingleFrameDataset(Dataset):
 
             newH, newW = canvasH, canvasW
 
-        # 随机 crop 到 (H,W)
-        # crop 左上角 (i,j)
         if newH > H:
             i = random.randint(0, newH - H)
         else:
@@ -110,8 +147,6 @@ class SingleFrameDataset(Dataset):
 
         img3 = TF.crop(img2, i, j, H, W)
 
-        # crop 会让 bbox 相对坐标发生平移：从 canvas 坐标转到 crop 坐标
-        # 先转像素，再减去 crop 偏移，再归一化到 (H,W)
         x = cx2 * newW
         y = cy2 * newH
         bw = w2 * newW
@@ -129,9 +164,6 @@ class SingleFrameDataset(Dataset):
         return img3, torch.tensor([cx3, cy3, w3, h3], dtype=torch.float32)
 
     def _random_color(self, img):
-        # img: float [0,1]
-        # 颜色抖动（手写简单版，避免引入 Compose）
-        # brightness/contrast/saturation/hue
         b = random.uniform(0.8, 1.2)
         c = random.uniform(0.8, 1.2)
         s = random.uniform(0.8, 1.2)
@@ -144,34 +176,36 @@ class SingleFrameDataset(Dataset):
         return img.clamp(0, 1)
 
     def _random_erase(self, img):
-        # 随机擦除：不改 bbox（当作遮挡增强）
         C, H, W = img.shape
         area = H * W
         erase_area = random.uniform(0.02, 0.15) * area
         aspect = random.uniform(0.3, 3.3)
 
-        h = int(round((erase_area * aspect) ** 0.5))
-        w = int(round((erase_area / aspect) ** 0.5))
-        if h <= 0 or w <= 0:
+        hh = int(round((erase_area * aspect) ** 0.5))
+        ww = int(round((erase_area / aspect) ** 0.5))
+        if hh <= 0 or ww <= 0:
             return img
 
-        y = random.randint(0, max(0, H - h))
-        x = random.randint(0, max(0, W - w))
+        y = random.randint(0, max(0, H - hh))
+        x = random.randint(0, max(0, W - ww))
 
         img = img.clone()
-        img[:, y:y+h, x:x+w] = 0.0
+        img[:, y:y+hh, x:x+ww] = 0.0
         return img
 
     def __getitem__(self, idx):
-        item = self.data[idx]
-        img_path = item["img_path"]
-        bbox = torch.tensor(item["bbox"], dtype=torch.float32)  # (cx,cy,w,h) norm
+        img_path = self.data[idx]  # ✅ 现在 item 就是图片路径字符串
+
+        # 读对应的 yolo txt
+        label_path = self._label_path_from_img(img_path)
+        records = self._read_yolo_bboxes(label_path)
+        bbox = self._select_one_bbox(records)  # float32 [4] norm
 
         # 读图：uint8 [C,H,W]
-        img = read_image(img_path)[:3]  # 防止有 alpha
+        img = read_image(img_path)[:3]
         img = img.float() / 255.0
 
-        # resize 到固定训练尺寸：bbox 归一化则不需要改
+        # resize 到固定训练尺寸：bbox 是归一化，resize 不需要改
         img = TF.resize(img, list(self.img_size), antialias=True)
 
         if self.augment:
