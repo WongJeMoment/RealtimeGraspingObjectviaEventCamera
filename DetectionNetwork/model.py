@@ -10,12 +10,16 @@ Outputs:
   each Px: Tensor[B, 5, H, W]
     channels = (l, t, r, b, obj_logit)
 
+Decode:
+  model.decode(preds, conf_thres, topk, img_size) -> boxes/scores
+  (No NMS inside decode)
+
 This file intentionally avoids any YOLO-specific naming.
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -135,6 +139,7 @@ class FeaturePyramid(nn.Module):
 class ObjectnessHead(nn.Module):
     """
     Output per level: [B, 5, H, W] = (l,t,r,b,obj_logit)
+    NOTE: l,t,r,b are distances in "cell units" (to be multiplied by stride at decode time).
     """
     def __init__(self, in_ch: int, hidden: int = 128):
         super().__init__()
@@ -197,13 +202,118 @@ class CCGODetector(nn.Module):
             self.head5(p5),
         ]
 
+    @torch.no_grad()
+    def decode(
+        self,
+        preds: List[torch.Tensor],
+        conf_thres: float = 0.25,
+        topk: int = 300,
+        img_size: Optional[int] = None,
+        clip: bool = True,
+        relu_ltrb: bool = True,
+    ) -> List[Dict[str, torch.Tensor]]:
+        """
+        Decode raw dense outputs into image-space boxes (xyxy) + scores.
+
+        Args:
+            preds: list of [B,5,H,W], channels=(l,t,r,b,obj_logit)
+            conf_thres: threshold on sigmoid(obj_logit)
+            topk: keep top-k scored boxes per image after thresholding (across all levels)
+            img_size: if not None, clip boxes into [0, img_size-1]
+            clip: whether to clip boxes
+            relu_ltrb: apply relu to ltrb to enforce non-negative distances
+
+        Returns:
+            results: list length B, each dict:
+              {
+                "boxes": Tensor[N,4] in xyxy (float, pixel coords),
+                "scores": Tensor[N]
+              }
+            NOTE: This does NOT perform NMS.
+        """
+        device = preds[0].device
+        B = preds[0].shape[0]
+        strides = self.cfg.strides
+
+        results: List[Dict[str, torch.Tensor]] = []
+        for b in range(B):
+            boxes_all = []
+            scores_all = []
+
+            for lvl, p in enumerate(preds):
+                stride = strides[lvl]
+                p_b = p[b]  # [5,H,W]
+                ltrb = p_b[0:4]  # [4,H,W]
+                if relu_ltrb:
+                    ltrb = torch.relu(ltrb)
+
+                obj_logit = p_b[4]              # [H,W]
+                score = torch.sigmoid(obj_logit)  # [H,W]
+                H, W = score.shape
+
+                ys, xs = torch.meshgrid(
+                    torch.arange(H, device=device),
+                    torch.arange(W, device=device),
+                    indexing="ij",
+                )
+                cx = (xs + 0.5) * stride
+                cy = (ys + 0.5) * stride
+
+                # l,t,r,b: cell units -> pixels
+                l = ltrb[0] * stride
+                t = ltrb[1] * stride
+                r = ltrb[2] * stride
+                bt = ltrb[3] * stride
+
+                x1 = cx - l
+                y1 = cy - t
+                x2 = cx + r
+                y2 = cy + bt
+
+                keep = score > conf_thres
+                if keep.sum() == 0:
+                    continue
+
+                boxes = torch.stack([x1[keep], y1[keep], x2[keep], y2[keep]], dim=1)
+                sc = score[keep]
+                boxes_all.append(boxes)
+                scores_all.append(sc)
+
+            if len(boxes_all) == 0:
+                results.append({
+                    "boxes": torch.zeros((0, 4), device=device),
+                    "scores": torch.zeros((0,), device=device),
+                })
+                continue
+
+            boxes = torch.cat(boxes_all, dim=0)
+            scores = torch.cat(scores_all, dim=0)
+
+            if clip and (img_size is not None):
+                boxes[:, 0] = boxes[:, 0].clamp(0, img_size - 1)
+                boxes[:, 1] = boxes[:, 1].clamp(0, img_size - 1)
+                boxes[:, 2] = boxes[:, 2].clamp(0, img_size - 1)
+                boxes[:, 3] = boxes[:, 3].clamp(0, img_size - 1)
+
+            if topk is not None and boxes.shape[0] > topk:
+                idx = scores.topk(topk, largest=True).indices
+                boxes = boxes[idx]
+                scores = scores[idx]
+
+            results.append({"boxes": boxes, "scores": scores})
+
+        return results
+
 
 # -------------------------
-# Sanity check
+# Sanity check + decode demo
 # -------------------------
 if __name__ == "__main__":
     model = CCGODetector(DetectorConfig(in_channels=3))
     x = torch.randn(1, 3, 640, 640)
-    outs = model(x)
-    for o in outs:
+    preds = model(x)
+    for o in preds:
         print(o.shape)
+
+    res = model.decode(preds, conf_thres=0.25, topk=50, img_size=640)
+    print("Decoded boxes:", res[0]["boxes"].shape, "scores:", res[0]["scores"].shape)
