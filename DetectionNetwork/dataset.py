@@ -42,7 +42,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from consistency import ConsistencyConfig, build_consistency_map_1chw
+from DetectionNetwork.consistency import ConsistencyConfig, build_consistency_map_1chw
 
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
