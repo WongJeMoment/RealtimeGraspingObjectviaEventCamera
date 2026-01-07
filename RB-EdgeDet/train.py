@@ -1,214 +1,231 @@
 # train.py
+# -*- coding: utf-8 -*-
+"""
+Training entry for CCGODetector + CCGO (Innovation A).
+
+Assumptions:
+- Dataset returns:
+    sample["img"]   : FloatTensor [3, S, S]
+    sample["C"]     : FloatTensor [1, S, S]
+    sample["boxes"] : FloatTensor [N, 4] (xyxy pixel on resized image)
+- Model returns preds = [P3, P4, P5], each [B, 5, H, W]
+- Loss: DetectionLoss(preds, C, boxes_list)
+"""
+
+from __future__ import annotations
 import os
-from tqdm import tqdm
+from pathlib import Path
+from typing import List, Dict
 
 import torch
-import torch.optim as optim
+from torch.utils.data import DataLoader
 
-import config
-from DetectionNetwork.data import DataConfig, build_dataloader
-from DetectionNetwork.model import build_model
-from DetectionNetwork.loss import FCOSLoss
-from DetectionNetwork.utils import (
-    set_seed,
-    get_device,
-    save_checkpoint,
+from config import (
+    DEVICE,
+    set_global_seed,
+    TRAIN_IMG_DIR, TRAIN_LABEL_DIR,
+    VAL_IMG_DIR, VAL_LABEL_DIR,
+    INPUT_SIZE, STRIDES,
+    BATCH_SIZE, EPOCHS, LR,
+    MODEL_SAVE_PATH, MODEL_SAVE_TEMPLATE,
 )
 
-DATASET_ROOT = config.TRAIN_IMG_DIR.parents[1]   # .../Dataset
-TRAIN_SPLIT = config.TRAIN_IMG_DIR.name           # apple1
-VAL_SPLIT = config.VAL_IMG_DIR.name
-
-# -------------------------
-# Train one epoch
-# -------------------------
-def train_one_epoch(
-    model,
-    dataloader,
-    optimizer,
-    criterion,
-    device,
-    epoch,
-):
-    model.train()
-    total_loss = 0.0
-
-    pbar = tqdm(dataloader, desc=f"Train Epoch {epoch}", ncols=120)
-    for i, (x5, targets) in enumerate(pbar):
-        x5 = x5.to(device, non_blocking=True)
-
-        for t in targets:
-            t["boxes_xyxy"] = t["boxes_xyxy"].to(device)
-            t["labels"] = t["labels"].to(device)
-
-        outputs = model(x5)
-        loss_dict = criterion(outputs, targets)
-        loss = loss_dict["loss"]
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-
-        if i % config.PRINT_FREQ == 0:
-            pbar.set_postfix({
-                "loss": f"{loss.item():.4f}",
-                "cls": f"{loss_dict['loss_cls']:.3f}",
-                "reg": f"{loss_dict['loss_reg']:.3f}",
-                "ctr": f"{loss_dict['loss_ctr']:.3f}",
-            })
-
-    return total_loss / max(1, len(dataloader))
+from DetectionNetwork.dataset import DetectionCCGODataset, DatasetConfig
+from DetectionNetwork.model import CCGODetector, DetectorConfig
+from DetectionNetwork.loss import DetectionLoss, LossConfig
+from Visual import visualize_and_save
 
 
 # -------------------------
-# Validation
+# Collate: variable number of boxes
 # -------------------------
+def collate_fn(batch: List[Dict]):
+    imgs = torch.stack([b["img"] for b in batch], dim=0)  # [B,3,S,S]
+    Cs = torch.stack([b["C"] for b in batch], dim=0)      # [B,1,S,S]
+    boxes = [b["boxes"] for b in batch]                   # list of [Ni,4]
+    metas = [b["meta"] for b in batch]
+    return {"img": imgs, "C": Cs, "boxes": boxes, "meta": metas}
+
+
 @torch.no_grad()
-def validate(
-    model,
-    dataloader,
-    criterion,
-    device,
-    epoch,
-):
+def evaluate_one_epoch(model, loss_fn, loader, device):
     model.eval()
-    total_loss = 0.0
+    total = 0.0
+    n = 0
+    agg = {"loss_total": 0.0, "loss_box": 0.0, "loss_obj": 0.0, "loss_ccgo": 0.0}
 
-    pbar = tqdm(dataloader, desc=f"Val Epoch {epoch}", ncols=120)
-    for x5, targets in pbar:
-        x5 = x5.to(device, non_blocking=True)
+    for batch in loader:
+        img = batch["img"].to(device)
+        C = batch["C"].to(device)
+        boxes = batch["boxes"]
 
-        for t in targets:
-            t["boxes_xyxy"] = t["boxes_xyxy"].to(device)
-            t["labels"] = t["labels"].to(device)
+        preds = model(img)
+        loss, logs = loss_fn(preds, C, boxes)
 
-        outputs = model(x5)
-        loss = criterion(outputs, targets)["loss"]
+        bs = img.shape[0]
+        total += float(loss.detach().cpu().item()) * bs
+        n += bs
+        for k in agg:
+            agg[k] += float(logs.get(k, 0.0)) * bs
 
-        total_loss += loss.item()
-        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+    for k in agg:
+        agg[k] /= max(1, n)
+    return agg
 
-    return total_loss / max(1, len(dataloader))
 
-
-# -------------------------
-# Main
-# -------------------------
 def main():
-    # reproducibility
-    set_seed(42)
-    device = get_device()
+    # 0) seeds
+    set_global_seed(42)
 
-    # -------------------------
-    # Data
-    # -------------------------
-    train_data_cfg = DataConfig(
-        root=DATASET_ROOT,
-        split=TRAIN_SPLIT,
-        img_size=config.INPUT_WIDTH,  # 或 (W,H) 看你 data.py
-        num_classes=config.NUM_CLASSES,
-        hflip_prob=0.5,
+    device = torch.device(DEVICE)
+    print("Device:", device)
+
+    # 1) dataset
+    train_cfg = DatasetConfig(
+        images_dir=str(TRAIN_IMG_DIR),
+        labels_dir=str(TRAIN_LABEL_DIR),
+        img_size=INPUT_SIZE,
+    )
+    val_cfg = DatasetConfig(
+        images_dir=str(VAL_IMG_DIR),
+        labels_dir=str(VAL_LABEL_DIR),
+        img_size=INPUT_SIZE,
     )
 
-    val_data_cfg = DataConfig(
-        root=DATASET_ROOT,
-        split=VAL_SPLIT,
-        img_size=config.INPUT_WIDTH,
-        num_classes=config.NUM_CLASSES,
-        hflip_prob=0.0,
-    )
+    train_ds = DetectionCCGODataset(train_cfg, augment=None)
+    val_ds = DetectionCCGODataset(val_cfg, augment=None)
 
-    train_loader = build_dataloader(
-        train_data_cfg,
-        batch_size=config.BATCH_SIZE,
-        num_workers=config.NUM_WORKERS,
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
         shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=collate_fn,
+        drop_last=True,
     )
-
-    val_loader = build_dataloader(
-        val_data_cfg,
-        batch_size=config.BATCH_SIZE,
-        num_workers=config.NUM_WORKERS,
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=BATCH_SIZE,
         shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=collate_fn,
+        drop_last=False,
     )
 
-    # -------------------------
-    # Model
-    # -------------------------
-    model = build_model(
-        num_classes=config.NUM_CLASSES,
-        fpn_out=config.FPN_OUT_CHANNELS,
-        head_feat=config.HEAD_CHANNELS,
-        head_convs=config.HEAD_CONVS,
-        use_cepm=config.USE_CEPM,
-        pretrained_backbone=config.PRETRAINED_BACKBONE,
+    print(f"Train samples: {len(train_ds)} | Val samples: {len(val_ds)}")
+
+    # 2) model
+    model = CCGODetector(
+        DetectorConfig(
+            in_channels=3,         # 如果你要 RGB+C 输入，改为 4
+            base=32,
+            fpn_channels=128,
+            head_channels=128,
+            strides=STRIDES,
+        )
     ).to(device)
 
-    # -------------------------
-    # Loss
-    # -------------------------
-    criterion = FCOSLoss(
-        num_classes=config.NUM_CLASSES,
-        strides=config.STRIDES,
-        cls_weight=config.LOSS_CLS_WEIGHT,
-        reg_weight=config.LOSS_REG_WEIGHT,
-        ctr_weight=config.LOSS_CTR_WEIGHT,
-    )
+    # 3) loss
+    loss_fn = DetectionLoss(
+        LossConfig(
+            img_size=INPUT_SIZE,
+            strides=STRIDES,
+            lambda_box=1.0,
+            lambda_obj=1.0,
+            lambda_ccgo=0.5,   # 创新点A权重：建议从 0.2~0.8 之间试
+            center_radius=2.5,
+        )
+    ).to(device)
 
-    # -------------------------
-    # Optimizer
-    # -------------------------
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=config.LR,
-        weight_decay=config.WEIGHT_DECAY,
-    )
+    # 4) optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
 
-    # -------------------------
-    # Training loop
-    # -------------------------
+    # 5) train loop
     best_val = 1e9
-    os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
+    Path(MODEL_SAVE_PATH).parent.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, config.EPOCHS + 1):
-        train_loss = train_one_epoch(
-            model, train_loader, optimizer, criterion, device, epoch
-        )
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
 
-        val_loss = validate(
-            model, val_loader, criterion, device, epoch
-        )
+        running = 0.0
+        count = 0
+        for it, batch in enumerate(train_loader, start=1):
+            img = batch["img"].to(device, non_blocking=True)
+            C = batch["C"].to(device, non_blocking=True)
+            boxes = batch["boxes"]
 
-        print(f"[Epoch {epoch}] train: {train_loss:.4f} | val: {val_loss:.4f}")
+            preds = model(img)
+            loss, logs = loss_fn(preds, C, boxes)
 
-        # save last
-        save_checkpoint(
-            config.LAST_MODEL_PATH,
-            model,
-            optimizer,
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            optimizer.step()
+
+            bs = img.shape[0]
+            running += float(loss.detach().cpu().item()) * bs
+            count += bs
+
+            if it % 20 == 0:
+                print(
+                    f"[Epoch {epoch:03d}/{EPOCHS:03d}] "
+                    f"Iter {it:04d} | "
+                    f"loss={logs['loss_total']:.4f} "
+                    f"(box={logs['loss_box']:.4f}, obj={logs['loss_obj']:.4f}, ccgo={logs['loss_ccgo']:.4f})"
+                )
+
+        train_loss = running / max(1, count)
+
+        # 6) validate
+        val_logs = evaluate_one_epoch(model, loss_fn, val_loader, device)
+        val_loss = val_logs["loss_total"]
+        visualize_and_save(
+            model=model,
+            dataloader=val_loader,
+            device=device,
+            save_dir="bbox_vis",
             epoch=epoch,
+            max_images=20,
+            conf_thres=0.3,
+            iou_thres=0.6,
         )
+
+        print(
+            f"\nEpoch {epoch:03d} done | "
+            f"train_loss={train_loss:.4f} | "
+            f"val_loss={val_loss:.4f} "
+            f"(box={val_logs['loss_box']:.4f}, obj={val_logs['loss_obj']:.4f}, ccgo={val_logs['loss_ccgo']:.4f})\n"
+        )
+
+        # 7) save
+        ckpt = {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "cfg": {
+                "INPUT_SIZE": INPUT_SIZE,
+                "STRIDES": STRIDES,
+                "LR": LR,
+                "BATCH_SIZE": BATCH_SIZE,
+            },
+        }
+
+        # always save latest
+        torch.save(ckpt, MODEL_SAVE_PATH)
+
+        # save per-epoch
+        torch.save(ckpt, str(MODEL_SAVE_TEMPLATE).format(epoch=epoch))
 
         # save best
         if val_loss < best_val:
             best_val = val_loss
-            save_checkpoint(
-                config.BEST_MODEL_PATH,
-                model,
-                optimizer,
-                epoch=epoch,
-                extra={"val_loss": val_loss},
-            )
+            best_path = str(Path(MODEL_SAVE_PATH).with_name("ccgo_detector_best.pth"))
+            torch.save(ckpt, best_path)
+            print(f"✅ Best checkpoint saved: {best_path} (val_loss={best_val:.4f})")
 
-        if config.SAVE_EVERY_EPOCH:
-            save_checkpoint(
-                str(config.EPOCH_MODEL_TEMPLATE).format(epoch=epoch),
-                model,
-                optimizer,
-                epoch=epoch,
-            )
+    print("Training finished.")
 
 
 if __name__ == "__main__":
