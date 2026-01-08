@@ -27,7 +27,7 @@ IOU_THRES = 0.6
 TOPK = 300
 
 SAVE_DIR = "./vis_results"
-
+MIN_AREA = 32 * 32
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # =========================
@@ -84,6 +84,18 @@ def draw_boxes(img_rgb, boxes, color_bgr, scores=None):
             )
     return out
 
+def filter_small_boxes_xyxy(boxes: torch.Tensor, scores: torch.Tensor,
+                            min_area: float = 32*32):
+    """
+    boxes: [N,4] xyxy (pixel)
+    scores: [N]
+    """
+    if boxes.numel() == 0:
+        return boxes, scores
+    wh = (boxes[:, 2:4] - boxes[:, 0:2]).clamp(min=0)
+    area = wh[:, 0] * wh[:, 1]
+    keep = area >= min_area
+    return boxes[keep], scores[keep]
 
 # =========================
 # ✅ 一键运行主函数
@@ -156,6 +168,7 @@ def main():
 
             pb = decoded[i]["boxes"]
             ps = decoded[i]["scores"]
+            pb, ps = filter_small_boxes_xyxy(pb, ps, min_area=MIN_AREA)
 
             keep = nms_xyxy(pb, ps, IOU_THRES)
             pb = pb[keep]
