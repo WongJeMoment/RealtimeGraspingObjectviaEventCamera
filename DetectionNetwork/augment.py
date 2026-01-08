@@ -35,6 +35,10 @@ class AugmentConfig:
     # box filter
     min_box: float = 2.0
 
+    # red/blue channel gain (img only, keep structure, no hue shift)
+    p_rb_gain: float = 0.6
+    rb_gain_range: float = 0.25   # gain in [1-r, 1+r], e.g. 0.25 -> [0.75, 1.25]
+
 
 def _ensure_float32(a):
     return a.astype(np.float32, copy=False)
@@ -49,6 +53,22 @@ def _clip_xyxy(boxes: np.ndarray, S: int) -> np.ndarray:
     boxes[:, 3] = np.clip(boxes[:, 3], 0, S - 1)
     return boxes
 
+def _rb_channel_gain(img_rgb: np.ndarray, gain_range: float) -> np.ndarray:
+    """
+    Randomly scale R and B channels only (RGB image).
+    This changes intensity but avoids explicit hue rotation.
+    """
+    img = img_rgb.astype(np.float32)
+
+    r_gain = np.random.uniform(1.0 - gain_range, 1.0 + gain_range)
+    b_gain = np.random.uniform(1.0 - gain_range, 1.0 + gain_range)
+
+    # RGB: channel 0=R, 1=G, 2=B
+    img[:, :, 0] *= r_gain
+    img[:, :, 2] *= b_gain
+
+    img = np.clip(img, 0, 255).astype(np.uint8)
+    return img
 
 def _filter_valid(boxes: np.ndarray, min_box: float) -> np.ndarray:
     if boxes.size == 0:
@@ -177,6 +197,9 @@ class TrainAugment:
         # --- color (img only)
         if np.random.rand() < cfg.p_color:
             img_lb = _color_jitter(img_lb, cfg.brightness, cfg.contrast)
+            # --- random R/B gain (img only)
+            if np.random.rand() < cfg.p_rb_gain:
+                img_lb = _rb_channel_gain(img_lb, cfg.rb_gain_range)
 
         # --- noise (img only)
         if np.random.rand() < cfg.p_noise:
