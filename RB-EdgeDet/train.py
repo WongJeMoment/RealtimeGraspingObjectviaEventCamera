@@ -28,12 +28,14 @@ from config import (
     INPUT_SIZE, STRIDES,
     BATCH_SIZE, EPOCHS, LR,
     MODEL_SAVE_PATH, MODEL_SAVE_TEMPLATE,
+    MODEL_SAVE_LATEST, MODEL_SAVE_BEST
 )
 
 from DetectionNetwork.dataset import DetectionCCGODataset, DatasetConfig
 from DetectionNetwork.model import CCGODetector, DetectorConfig
 from DetectionNetwork.loss import DetectionLoss, LossConfig
 from Visual import visualize_and_save
+from DetectionNetwork.augment import TrainAugment, AugmentConfig
 
 
 # -------------------------
@@ -91,8 +93,8 @@ def main():
         labels_dir=str(VAL_LABEL_DIR),
         img_size=INPUT_SIZE,
     )
-
-    train_ds = DetectionCCGODataset(train_cfg, augment=None)
+    augment = TrainAugment(AugmentConfig(img_size=INPUT_SIZE))
+    train_ds = DetectionCCGODataset(train_cfg, augment=augment)
     val_ds = DetectionCCGODataset(val_cfg, augment=None)
 
     train_loader = DataLoader(
@@ -143,8 +145,8 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
 
     # 5) train loop
-    best_val = 1e9
-    Path(MODEL_SAVE_PATH).parent.mkdir(parents=True, exist_ok=True)
+    best_val = float("inf")
+    Path(MODEL_SAVE_LATEST).parent.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -199,11 +201,12 @@ def main():
             f"(box={val_logs['loss_box']:.4f}, obj={val_logs['loss_obj']:.4f}, ccgo={val_logs['loss_ccgo']:.4f})\n"
         )
 
-        # 7) save
+        # 7) save (only latest + best, .pth)
         ckpt = {
             "epoch": epoch,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "val_loss": val_loss,
             "cfg": {
                 "INPUT_SIZE": INPUT_SIZE,
                 "STRIDES": STRIDES,
@@ -212,18 +215,17 @@ def main():
             },
         }
 
-        # always save latest
-        torch.save(ckpt, MODEL_SAVE_PATH)
+        # ---- save latest (always overwrite) ----
+        torch.save(ckpt, MODEL_SAVE_LATEST)
 
-        # save per-epoch
-        torch.save(ckpt, str(MODEL_SAVE_TEMPLATE).format(epoch=epoch))
-
-        # save best
+        # ---- save best (only if improved) ----
         if val_loss < best_val:
             best_val = val_loss
-            best_path = str(Path(MODEL_SAVE_PATH).with_name("ccgo_detector_best.pth"))
-            torch.save(ckpt, best_path)
-            print(f"✅ Best checkpoint saved: {best_path} (val_loss={best_val:.4f})")
+            torch.save(ckpt, MODEL_SAVE_BEST)
+            print(
+                f"✅ Best model updated: {MODEL_SAVE_BEST} "
+                f"(val_loss={best_val:.6f})"
+            )
 
     print("Training finished.")
 

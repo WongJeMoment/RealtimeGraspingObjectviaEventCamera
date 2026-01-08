@@ -82,6 +82,8 @@ VAL_LABEL_DIR = DATA_ROOT / "Label" / "apple2"
 TEST_IMG_DIR = DATA_ROOT / "Img" / "apple_test"
 TEST_LABEL_DIR = DATA_ROOT / "Label" / "apple_test"
 
+MODEL_SAVE_LATEST = "checkpoints/ccgo_detector_latest.pth"
+MODEL_SAVE_BEST   = "checkpoints/ccgo_detector_best.pth"
 
 # ============================================================
 # 5. TRAINING HYPERPARAMETERS
