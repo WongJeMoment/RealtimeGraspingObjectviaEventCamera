@@ -45,7 +45,7 @@ DEVICE = cfg.DEVICE
 # 重检策略
 # -------------------------
 REDETECT_EVERY = 1          # 每 N 帧强制重检一次；0 表示关闭
-REDETECT_CONF_THRES = 0.55  # tracker conf 低于该值触发重检
+REDETECT_CONF_THRES = 0.65  # tracker conf 低于该值触发重检
 PRINT_DEBUG_EVERY = 5       # 每 N 帧打印一次（0 关闭）
 
 
